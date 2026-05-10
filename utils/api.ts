@@ -83,7 +83,7 @@ function parseError(error: unknown): ApiError {
   // OpenAI SDK 错误
   if (error instanceof OpenAI.APIError) {
     const status = error.status;
-    
+
     if (status === 401 || status === 403) {
       return new ApiError(ERROR_MESSAGES['AUTH_ERROR'], 'AUTH_ERROR', false, error);
     }
@@ -113,7 +113,7 @@ function parseError(error: unknown): ApiError {
 
   // 通用错误处理
   const message = error instanceof Error ? error.message : String(error);
-  
+
   // 尝试从错误消息中识别类型
   const lowerMessage = message.toLowerCase();
   if (lowerMessage.includes('timeout')) {
@@ -263,6 +263,16 @@ export async function fetchModels(baseUrl: string, apiKey: string, providerType?
 // 工具执行器类型
 export type ToolExecutor = (toolCall: ToolCall) => Promise<ToolResult>;
 
+export interface ChatContextConfig {
+  sharePageContent?: boolean;
+  skills?: SkillInfo[];
+  mcpTools?: McpTool[];
+  browserAutomationAvailable?: boolean;
+  browserVisionAvailable?: boolean;
+  pageInfo?: { domain: string; title: string; url?: string };
+  language?: Language;
+}
+
 // Function Calling 配置
 export interface FunctionCallingConfig {
   enableTools: boolean;
@@ -273,7 +283,7 @@ export interface FunctionCallingConfig {
 }
 
 // 流式聊天事件类型
-export type StreamEvent = 
+export type StreamEvent =
   | { type: 'content'; content: string }
   | { type: 'reasoning'; content: string }  // 思维链内容（如 DeepSeek reasoning_content）
   | { type: 'tool_call'; toolCall: ToolCall }
@@ -286,13 +296,13 @@ export type StreamEvent =
 // 用于处理某些模型（如 GLM-4.7）对无参数工具重复返回 "{}" 的情况
 function isJsonClosed(str: string): boolean {
   if (!str) return false;
-  
+
   let braceCount = 0;
   let inString = false;
-  
+
   for (let i = 0; i < str.length; i++) {
     const char = str[i];
-    
+
     if (char === '"' && str[i - 1] !== '\\') {
       inString = !inString;
     } else if (!inString) {
@@ -300,7 +310,7 @@ function isJsonClosed(str: string): boolean {
       else if (char === '}') braceCount--;
     }
   }
-  
+
   return braceCount === 0 && str.includes('{');
 }
 
@@ -308,18 +318,18 @@ function isJsonClosed(str: string): boolean {
 // 用于处理某些模型（如 GLM-4.7）在生成嵌套 JSON 时提前结束输出的情况
 function tryFixIncompleteJson(str: string): string {
   if (!str) return str;
-  
+
   // 先尝试直接解析，如果成功就不需要修复
   try {
     JSON.parse(str);
     return str;
   } catch {}
-  
+
   // 计算缺失的括号
   let braceCount = 0;
   let bracketCount = 0;
   let inString = false;
-  
+
   for (let i = 0; i < str.length; i++) {
     const char = str[i];
     if (char === '"' && str[i - 1] !== '\\') {
@@ -331,12 +341,12 @@ function tryFixIncompleteJson(str: string): string {
       else if (char === ']') bracketCount--;
     }
   }
-  
+
   // 补全缺失的括号
   let fixed = str;
   while (bracketCount > 0) { fixed += ']'; bracketCount--; }
   while (braceCount > 0) { fixed += '}'; braceCount--; }
-  
+
   // 验证补全后是否有效
   try {
     JSON.parse(fixed);
@@ -451,11 +461,46 @@ function sanitizeMessagesForVision(messages: ApiMessage[], allowImages: boolean)
   });
 }
 
+export function appendToolResultMessages(
+  currentMessages: ApiMessage[],
+  toolCall: { id: string; name: string },
+  result: ToolResult,
+  deferredImageMessages?: ApiMessage[],
+): void {
+  currentMessages.push({
+    role: 'tool',
+    content: result.result,
+    tool_call_id: toolCall.id,
+    name: toolCall.name,
+  });
+
+  if (!result.images?.length) return;
+
+  const imageMessages = deferredImageMessages ?? currentMessages;
+  for (const image of result.images) {
+    imageMessages.push({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: image.description
+            ? `工具 ${toolCall.name} 返回了一张图片：${image.description}`
+            : `工具 ${toolCall.name} 返回了一张图片。`,
+        },
+        {
+          type: 'image_url',
+          image_url: { url: image.dataUrl },
+        },
+      ],
+    });
+  }
+}
+
 
 export async function* streamChat(
   provider: AIProvider,
   messages: ChatMessage[],
-  context?: { sharePageContent?: boolean; skills?: SkillInfo[]; mcpTools?: McpTool[]; pageInfo?: { domain: string; title: string; url?: string }; language?: Language },
+  context?: ChatContextConfig,
   config?: FunctionCallingConfig,
   retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG,
   previousApiMessages?: ApiMessage[]  // 新增：传入之前保存的完整 API 上下文
@@ -483,9 +528,9 @@ export async function* streamChat(
       throw createUserAbortError();
     }
   };
-  
+
   const client = createClient(provider);
-  
+
   const basePrompt = `You are a helpful AI assistant. Always respond using Markdown format for better readability. Use:
 - Headers (##, ###) for sections
 - **bold** and *italic* for emphasis
@@ -499,7 +544,7 @@ export async function* streamChat(
 
   // 构建初始消息
   let apiMessages: ApiMessage[];
-  
+
   if (previousApiMessages && previousApiMessages.length > 0) {
     // 如果有之前保存的 API 上下文，使用它并更新 system 消息
     apiMessages = sanitizeMessagesForVision(previousApiMessages, allowImages);
@@ -531,25 +576,25 @@ export async function* streamChat(
   // 获取过滤后的工具列表
   const tools = enableTools ? getFilteredTools(context) : [];
   const openaiTools = tools.length > 0 ? convertTools(tools) : undefined;
-  
+
   let iteration = 0;
   let currentMessages = [...apiMessages];
   let toolCallRetryCount = 0; // 工具调用重试计数（包括参数解析错误）
   const maxToolCallRetries = 3; // 工具调用最大重试次数
   let executedToolCallCount = 0;
-  
+
   while (iteration < maxIterations) {
     ensureNotAborted();
     iteration++;
-    
+
     // 带重试的 API 调用
     let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     let lastError: ApiError | null = null;
-    
+
     for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
       ensureNotAborted();
       const { controller, clear } = createTimeoutController(retryConfig.timeout, abortSignal);
-      
+
       try {
         stream = await client.chat.completions.create({
           model: provider.selectedModel,
@@ -560,78 +605,78 @@ export async function* streamChat(
         }, {
           signal: controller.signal,
         });
-        
+
         clear();
         lastError = null;
         break; // 成功，跳出重试循环
-        
+
       } catch (error) {
         clear();
         if (abortSignal?.aborted) {
           throw createUserAbortError(error);
         }
         lastError = parseError(error);
-        
+
         // 不可重试的错误，直接抛出
         if (!lastError.retryable) {
           yield { type: 'error', error: lastError, retrying: false, attempt };
           throw lastError;
         }
-        
+
         // 已达最大重试次数
         if (attempt >= retryConfig.maxRetries) {
           yield { type: 'error', error: lastError, retrying: false, attempt };
           throw lastError;
         }
-        
+
         // 通知正在重试
         const retryDelay = getRetryDelay(attempt, retryConfig);
-        yield { 
-          type: 'error', 
-          error: lastError, 
-          retrying: true, 
-          attempt 
+        yield {
+          type: 'error',
+          error: lastError,
+          retrying: true,
+          attempt
         };
-        yield { 
-          type: 'thinking', 
-          message: `请求失败，${Math.round(retryDelay / 1000)} 秒后重试 (${attempt + 1}/${retryConfig.maxRetries})...` 
+        yield {
+          type: 'thinking',
+          message: `请求失败，${Math.round(retryDelay / 1000)} 秒后重试 (${attempt + 1}/${retryConfig.maxRetries})...`
         };
-        
+
         await delay(retryDelay);
         ensureNotAborted();
       }
     }
-    
+
     // 如果没有成功获取 stream，抛出最后的错误
     if (!stream!) {
       throw lastError || new ApiError('未知错误', 'UNKNOWN', false);
     }
-    
+
     let fullContent = '';
     let fullReasoning = '';  // 思维链内容（如 DeepSeek reasoning_content）
-    
+
     // 工具调用收集器
     // 使用 id 作为主键来存储工具调用，这样更健壮
-    // 
+    //
     // 背景说明：
     // OpenAI 流式响应中，tool_calls 有两个标识字段：
     // - index: 流式传输时的"槽位编号"，用于拼接同一个工具调用的多个 chunks
     // - id: 工具调用的唯一标识符，用于后续提交工具执行结果时匹配
-    // 
+    //
     // 正常情况下，一个 index 只对应一个 id。但某些兼容层（如 newapi）
     // 可能在同一个 index 下返回多个不同 id 的工具调用，导致 arguments 被错误拼接。
-    // 
+    //
     // 解决方案：
     // 使用 Map<index, Map<id, toolCall>> 的双层结构，
     // 当同一个 index 出现新的 id 时，创建新的工具调用条目而不是累加 arguments。
     const toolCallsByIndex: Map<number, Map<string, { id: string; name: string; arguments: string }>> = new Map();
-    
+
     // 流式读取响应（带错误处理）
     try {
       for await (const chunk of stream) {
         ensureNotAborted();
         const delta = chunk.choices[0]?.delta;
-        
+
         // 处理思维链内容（DeepSeek reasoning_content）
         // 某些模型（如 DeepSeek-R1）会在 delta 中返回 reasoning_content 字段
         const reasoningContent = (delta as any)?.reasoning_content;
@@ -639,24 +684,24 @@ export async function* streamChat(
           fullReasoning += reasoningContent;
           yield { type: 'reasoning', content: reasoningContent };
         }
-        
+
         // 处理文本内容
         if (delta?.content) {
           fullContent += delta.content;
           yield { type: 'content', content: delta.content };
         }
-        
+
         // 处理工具调用增量
         if (delta?.tool_calls) {
           for (const tc of delta.tool_calls) {
             const index = tc.index;
-            
+
             // 确保该 index 的 Map 存在
             if (!toolCallsByIndex.has(index)) {
               toolCallsByIndex.set(index, new Map());
             }
             const indexMap = toolCallsByIndex.get(index)!;
-            
+
             // 如果有新的 id，说明是新的工具调用（即使 index 相同）
             // 这处理了某些 API 兼容层在同一 index 下返回多个工具调用的情况
             if (tc.id) {
@@ -709,7 +754,7 @@ export async function* streamChat(
       yield { type: 'error', error: apiError, retrying: false, attempt: retryConfig.maxRetries };
       throw apiError;
     }
-    
+
     // 将双层 Map 扁平化为工具调用数组
     const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
     for (const indexMap of toolCallsByIndex.values()) {
@@ -719,7 +764,7 @@ export async function* streamChat(
         }
       }
     }
-    
+
     // 检查是否有工具调用
     if (toolCalls.length > 0 && toolExecutor) {
       ensureNotAborted();
@@ -729,7 +774,7 @@ export async function* streamChat(
           tc.arguments = tryFixIncompleteJson(tc.arguments);
         }
       }
-      
+
       // 检查是否有参数解析错误
       // 如果有解析错误，剔除本次模型回复，直接重试
       let hasParseError = false;
@@ -745,12 +790,12 @@ export async function* streamChat(
           break;
         }
       }
-      
+
       // 如果有解析错误，剔除本次模型回复，直接重试
       if (hasParseError) {
         toolCallRetryCount++;
         console.warn(`[Retry] 检测到工具参数解析错误，剔除模型回复后重试 (${toolCallRetryCount}/${maxToolCallRetries})`);
-        
+
         // 检查是否超过最大重试次数
         if (toolCallRetryCount >= maxToolCallRetries) {
           const error = new ApiError(
@@ -761,16 +806,16 @@ export async function* streamChat(
           yield { type: 'error', error, retrying: false, attempt: toolCallRetryCount };
           throw error;
         }
-        
-        yield { 
-          type: 'thinking', 
-          message: `工具参数解析错误，正在重试 (${toolCallRetryCount}/${maxToolCallRetries})...` 
+
+        yield {
+          type: 'thinking',
+          message: `工具参数解析错误，正在重试 (${toolCallRetryCount}/${maxToolCallRetries})...`
         };
-        
+
         // 不添加本次 assistant 消息到 currentMessages，直接重试
         continue;
       }
-      
+
       // 构建 assistant 消息（包含 tool_calls 和 reasoning）
       const assistantToolCalls = toolCalls.map(tc => ({
         id: tc.id,
@@ -780,19 +825,21 @@ export async function* streamChat(
           arguments: tc.arguments,
         },
       }));
-      
+
+      const assistantMessageIndex = currentMessages.length;
       currentMessages.push({
         role: 'assistant',
         content: fullContent || null,
         reasoning: fullReasoning || null,
         tool_calls: assistantToolCalls,
       });
-      
+
       // 实时更新 API 上下文（记录 assistant 的 tool_calls）
       lastApiMessages = [...currentMessages];
-      
+
       // 执行每个工具调用
       let hasExecutionError = false;
+      const deferredImageMessages: ApiMessage[] = [];
       for (const tc of toolCalls) {
         ensureNotAborted();
         if (executedToolCallCount >= maxToolCalls) {
@@ -806,21 +853,21 @@ export async function* streamChat(
         }
 
         const parsedArgs = JSON.parse(tc.arguments || '{}');
-        
+
         const toolCall: ToolCall = {
           id: tc.id,
           name: tc.name,
           arguments: parsedArgs,
         };
-        
+
         yield { type: 'tool_call', toolCall };
         yield { type: 'thinking', message: getToolStatusText(tc.name, parsedArgs) };
-        
+
         // 执行工具
         executedToolCallCount++;
         const result = await toolExecutor(toolCall);
         yield { type: 'tool_result', result };
-        
+
         // 检查工具执行是否失败
         if (!result.success) {
           hasExecutionError = true;
@@ -828,7 +875,7 @@ export async function* streamChat(
           console.warn(`[Tool Execution Error] 工具执行失败 (${toolCallRetryCount}/${maxToolCallRetries})`);
           console.error('  工具名:', tc.name);
           console.error('  错误:', result.result);
-          
+
           // 检查是否超过最大重试次数
           if (toolCallRetryCount >= maxToolCallRetries) {
             const error = new ApiError(
@@ -839,51 +886,50 @@ export async function* streamChat(
             yield { type: 'error', error, retrying: false, attempt: toolCallRetryCount };
             throw error;
           }
-          
-          yield { 
-            type: 'thinking', 
-            message: `工具执行失败，正在重试 (${toolCallRetryCount}/${maxToolCallRetries})...` 
+
+          yield {
+            type: 'thinking',
+            message: `工具执行失败，正在重试 (${toolCallRetryCount}/${maxToolCallRetries})...`
           };
-          
+
           // 跳出工具执行循环，准备重试
           break;
         }
-        
-        // 添加工具结果消息
-        currentMessages.push({
-          role: 'tool',
-          content: result.result,
-          tool_call_id: tc.id,
-          name: tc.name,
-        });
-        
+
+        appendToolResultMessages(currentMessages, { id: tc.id, name: tc.name }, result, deferredImageMessages);
+
         // 实时更新 API 上下文（记录 tool result）
         lastApiMessages = [...currentMessages];
       }
-      
+
       // 如果有执行错误，剔除本次 assistant 消息，重试
       if (hasExecutionError) {
-        // 移除刚才添加的 assistant 消息
-        currentMessages.pop();
+        // 移除刚才添加的 assistant 消息和已执行工具结果
+        currentMessages.splice(assistantMessageIndex);
         continue;
       }
-      
+
+      if (deferredImageMessages.length > 0) {
+        currentMessages.push(...deferredImageMessages);
+        lastApiMessages = [...currentMessages];
+      }
+
       // 继续下一轮迭代
       continue;
     }
-    
+
     // 没有工具调用，结束循环
     lastApiMessages = [...currentMessages];
     if (fullContent || fullReasoning) {
-      lastApiMessages.push({ 
-        role: 'assistant', 
+      lastApiMessages.push({
+        role: 'assistant',
         content: fullContent || null,
         reasoning: fullReasoning || null,
       });
     }
     break;
   }
-  
+
   yield { type: 'done' };
 }
 
@@ -908,7 +954,7 @@ export async function* streamChatSimple(
 
   const client = createClient(provider);
   const allowImages = isVisionSupportedForModel(provider, provider.selectedModel);
-  
+
   const basePrompt = `You are a helpful AI assistant. Always respond using Markdown format for better readability. Use:
 - Headers (##, ###) for sections
 - **bold** and *italic* for emphasis
@@ -933,10 +979,10 @@ export async function* streamChatSimple(
 
   // 带重试的 API 调用
   let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
-  
+
   for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
     const { controller, clear } = createTimeoutController(retryConfig.timeout);
-    
+
     try {
       stream = await client.chat.completions.create({
         model: provider.selectedModel,
@@ -945,18 +991,18 @@ export async function* streamChatSimple(
       }, {
         signal: controller.signal,
       });
-      
+
       clear();
       break;
-      
+
     } catch (error) {
       clear();
       const apiError = parseError(error);
-      
+
       if (!apiError.retryable || attempt >= retryConfig.maxRetries) {
         throw apiError;
       }
-      
+
       const retryDelay = getRetryDelay(attempt, retryConfig);
       await delay(retryDelay);
     }

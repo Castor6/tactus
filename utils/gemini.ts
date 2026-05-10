@@ -573,7 +573,7 @@ export async function fetchGeminiModels(baseUrl: string, apiKey: string): Promis
 
 // ============ Main Streaming Function ============
 
-import { setLastApiMessages, type FunctionCallingConfig, type ToolExecutor } from './api';
+import { appendToolResultMessages, setLastApiMessages, type ChatContextConfig, type FunctionCallingConfig, type ToolExecutor } from './api';
 
 const DEFAULT_RETRY_CONFIG: RetryConfig = {
   maxRetries: 3,
@@ -585,13 +585,7 @@ const DEFAULT_RETRY_CONFIG: RetryConfig = {
 export async function* streamChatGemini(
   provider: AIProvider,
   messages: ChatMessage[],
-  context?: {
-    sharePageContent?: boolean;
-    skills?: SkillInfo[];
-    mcpTools?: McpTool[];
-    pageInfo?: { domain: string; title: string; url?: string };
-    language?: Language;
-  },
+  context?: ChatContextConfig,
   config?: FunctionCallingConfig,
   retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG,
   previousApiMessages?: ApiMessage[],
@@ -923,6 +917,7 @@ export async function* streamChatGemini(
         },
       }));
 
+      const assistantMessageIndex = currentMessages.length;
       currentMessages.push({
         role: 'assistant',
         content: fullContent || null,
@@ -933,6 +928,7 @@ export async function* streamChatGemini(
 
       // Execute each tool call
       let hasExecutionError = false;
+      const deferredImageMessages: ApiMessage[] = [];
       for (const tc of toolCalls) {
         ensureNotAborted();
         if (executedToolCallCount >= maxToolCalls) {
@@ -980,19 +976,19 @@ export async function* streamChatGemini(
           break;
         }
 
-        currentMessages.push({
-          role: 'tool',
-          content: result.result,
-          tool_call_id: tc.id,
-          name: tc.name,
-        });
+        appendToolResultMessages(currentMessages, { id: tc.id, name: tc.name }, result, deferredImageMessages);
 
         setLastApiMessages([...currentMessages]);
       }
 
       if (hasExecutionError) {
-        currentMessages.pop();
+        currentMessages.splice(assistantMessageIndex);
         continue;
+      }
+
+      if (deferredImageMessages.length > 0) {
+        currentMessages.push(...deferredImageMessages);
+        setLastApiMessages([...currentMessages]);
       }
 
       continue;

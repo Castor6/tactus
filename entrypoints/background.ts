@@ -4,6 +4,7 @@ import {
   watchAssistantDisplayMode,
   type AssistantDisplayMode,
 } from '../utils/storage';
+import { createBrowserAutomationController } from '../utils/browserAutomation';
 
 interface SurfaceContext {
   tabId?: number | null;
@@ -344,6 +345,7 @@ async function executeScriptInTab(tabId: number, code: string, args: Record<stri
 
 export default defineBackground(() => {
   let currentDisplayMode: AssistantDisplayMode = 'sidepanel';
+  const browserAutomation = createBrowserAutomationController();
 
   const updatePanelBehavior = async (mode: AssistantDisplayMode) => {
     currentDisplayMode = mode;
@@ -462,6 +464,31 @@ export default defineBackground(() => {
       executeScriptInTab(tabId, code, args, scriptId)
         .then(result => sendResponse({ success: true, result }))
         .catch(error => sendResponse({ success: false, error: error.message }));
+      return true;
+    }
+
+    if (message.type === 'BROWSER_AUTOMATION_COMMAND') {
+      const params = {
+        ...(message.params || {}),
+        session_id: message.sessionId,
+        turn_id: message.turnId,
+      };
+      browserAutomation.execute(message.command, params)
+        .then(result => sendResponse(result))
+        .catch(error => sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      return true;
+    }
+
+    if (message.type === 'BROWSER_AUTOMATION_END') {
+      browserAutomation.endSession(message.sessionId, { finalize: message.finalize === true })
+        .then(() => sendResponse({ success: true }))
+        .catch(error => sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        }));
       return true;
     }
 

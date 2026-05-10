@@ -57,7 +57,7 @@ import {
 } from '../../utils/db';
 import { streamChat, getLastApiMessages, setLastApiMessages, ApiError, type ToolExecutor, type ApiMessage } from '../../utils/api';
 import { extractPageContent, truncateContent } from '../../utils/pageExtractor';
-import { getToolStatusText, isMcpTool, parseMcpToolName, type ToolCall, type ToolResult, type SkillInfo } from '../../utils/tools';
+import { getToolStatusText, isBrowserAutomationTool, isMcpTool, parseMcpToolName, type ToolCall, type ToolResult, type SkillInfo } from '../../utils/tools';
 import { shouldSubmitOnEnter } from '../../utils/enterSubmit';
 import { getAllSkills, getSkillByName, getSkillFileAsText, type Skill } from '../../utils/skills';
 import { executeScript, setScriptConfirmCallback, type ScriptConfirmationRequest } from '../../utils/skillsExecutor';
@@ -704,6 +704,7 @@ async function regenerateResponse(): Promise<void> {
   toolStatus.value = null;
   chatAbortController.value?.abort();
   chatAbortController.value = new AbortController();
+  beginBrowserAutomationRun();
   let assistantMessage: ChatMessage | null = null;
   
   try {
@@ -770,7 +771,15 @@ async function regenerateResponse(): Promise<void> {
     for await (const event of streamChat(
       provider,
       messages.value.slice(0, -1),
-      { sharePageContent: sharePageContent.value, skills: skillsInfo, mcpTools: mcpTools.value, pageInfo, language: currentLanguage },
+      {
+        sharePageContent: sharePageContent.value,
+        skills: skillsInfo,
+        mcpTools: mcpTools.value,
+        browserAutomationAvailable,
+        browserVisionAvailable: browserAutomationAvailable && activeModelSupportsVision.value,
+        pageInfo,
+        language: currentLanguage,
+      },
       reactConfig,
       undefined, // retryConfig 使用默认值
       hasValidPreviousContext ? previousApiMessages : undefined
@@ -831,6 +840,7 @@ async function regenerateResponse(): Promise<void> {
       triggerRef(messages);
     }
   } finally {
+    await endBrowserAutomationRun(!browserAutomationWasStopped.value);
     chatAbortController.value = null;
     isLoading.value = false;
     releaseLockedTab();
@@ -846,6 +856,39 @@ const pendingScriptConfirm = ref<{
   request: ScriptConfirmationRequest;
   resolve: (result: { confirmed: boolean; trustForever: boolean }) => void;
 } | null>(null);
+
+interface BrowserAutomationMeta {
+  sessionId: string;
+  activeTabId: number | null;
+  activeTabTitle?: string;
+  activeTabUrl?: string;
+  groupTitle?: string;
+  lastAction: string;
+}
+
+interface BrowserAutomationRisk {
+  level: 'none' | 'sensitive' | 'destructive';
+  reasons: string[];
+  preview?: string;
+}
+
+interface BrowserAutomationConfirmRequest {
+  kind: 'sensitive';
+  title: string;
+  message: string;
+  risk?: BrowserAutomationRisk;
+  resolve: (confirmed: boolean) => void;
+}
+
+const browserAutomationAvailable = !import.meta.env.FIREFOX;
+const browserAutomationSessionId = ref<string | null>(null);
+const browserAutomationTurnId = ref<string | null>(null);
+const browserAutomationUsed = ref(false);
+const browserAutomationFinalized = ref(false);
+const browserAutomationWasStopped = ref(false);
+const browserAutomationStatus = ref<BrowserAutomationMeta | null>(null);
+const showBrowserAutomationConfirmModal = ref(false);
+const pendingBrowserAutomationConfirm = ref<BrowserAutomationConfirmRequest | null>(null);
 
 // MCP state
 const mcpTools = ref<McpTool[]>([]);
@@ -883,6 +926,9 @@ const allModelOptions = computed(() => {
 const activeModelSupportsVision = computed(() => {
   if (!activeProvider.value) return false;
   return isVisionSupportedForModel(activeProvider.value, activeProvider.value.selectedModel);
+});
+const browserAutomationConfirmPrimaryLabel = computed(() => {
+  return currentLanguage.value === 'zh-CN' ? '确认执行' : 'Confirm';
 });
 const hasPendingImages = computed(() => pendingImages.value.length > 0);
 const showSharePageHint = computed(() => {
@@ -1182,10 +1228,164 @@ function handleSidepanelSelectionMousedown(event: MouseEvent): void {
 
 function terminateCurrentGeneration(): void {
   if (!chatAbortController.value) return;
+  browserAutomationWasStopped.value = true;
   chatAbortController.value.abort();
   toolStatus.value = currentLanguage.value === 'zh-CN' ? '已终止' : 'Stopped';
   isLoading.value = false;
   releaseLockedTab();
+  void endBrowserAutomationRun(false);
+}
+
+function beginBrowserAutomationRun(): void {
+  browserAutomationSessionId.value = currentSession.value?.id
+    ? `chat_${currentSession.value.id}`
+    : `chat_${crypto.randomUUID()}`;
+  browserAutomationTurnId.value = crypto.randomUUID();
+  browserAutomationUsed.value = false;
+  browserAutomationFinalized.value = false;
+  browserAutomationWasStopped.value = false;
+  browserAutomationStatus.value = null;
+}
+
+async function endBrowserAutomationRun(finalize: boolean): Promise<void> {
+  const sessionId = browserAutomationSessionId.value;
+  if (!sessionId || !browserAutomationUsed.value) return;
+
+  try {
+    await browser.runtime.sendMessage({
+      type: 'BROWSER_AUTOMATION_END',
+      sessionId,
+      finalize: finalize && !browserAutomationFinalized.value,
+    });
+  } catch (error) {
+    console.error('Failed to end browser automation session:', error);
+  } finally {
+    browserAutomationSessionId.value = null;
+    browserAutomationTurnId.value = null;
+    browserAutomationUsed.value = false;
+    browserAutomationFinalized.value = false;
+    browserAutomationStatus.value = null;
+  }
+}
+
+function requestBrowserAutomationConfirmation(request: Omit<BrowserAutomationConfirmRequest, 'resolve'>): Promise<boolean> {
+  return new Promise(resolve => {
+    pendingBrowserAutomationConfirm.value = { ...request, resolve };
+    showBrowserAutomationConfirmModal.value = true;
+  });
+}
+
+function resolveBrowserAutomationConfirmation(confirmed: boolean): void {
+  pendingBrowserAutomationConfirm.value?.resolve(confirmed);
+  pendingBrowserAutomationConfirm.value = null;
+  showBrowserAutomationConfirmModal.value = false;
+}
+
+async function confirmSensitiveBrowserAutomation(response: any): Promise<boolean> {
+  return await requestBrowserAutomationConfirmation({
+    kind: 'sensitive',
+    title: currentLanguage.value === 'zh-CN' ? '确认敏感页面操作' : 'Confirm sensitive page action',
+    message: response.confirmationMessage || (currentLanguage.value === 'zh-CN'
+      ? '该页面操作可能涉及敏感或破坏性行为，请确认后继续。'
+      : 'This page action may be sensitive or destructive. Confirm to continue.'),
+    risk: response.risk,
+  });
+}
+
+function getBrowserAutomationToolResultText(toolName: string, result: any): string {
+  if (result?.dataUrl && result?.mimeType) {
+    return JSON.stringify({
+      screenshot: true,
+      mimeType: result.mimeType,
+      description: result.description || toolName,
+      note: 'Screenshot image is attached as a follow-up image context.',
+    }, null, 2);
+  }
+  return typeof result === 'string' ? result : JSON.stringify(result ?? {}, null, 2);
+}
+
+function buildBrowserAutomationToolResult(toolCall: ToolCall, response: any): ToolResult {
+  if (!response.success) {
+    return {
+      tool_call_id: toolCall.id,
+      name: toolCall.name,
+      result: response.error || '浏览器自动化执行失败',
+      success: false,
+    };
+  }
+
+  const result = response.result;
+  const toolResult: ToolResult = {
+    tool_call_id: toolCall.id,
+    name: toolCall.name,
+    result: getBrowserAutomationToolResultText(toolCall.name, result),
+    success: true,
+  };
+
+  if (result?.dataUrl && result?.mimeType) {
+    toolResult.images = [{
+      dataUrl: result.dataUrl,
+      mimeType: result.mimeType,
+      description: result.description || toolCall.name,
+    }];
+  }
+
+  return toolResult;
+}
+
+async function executeBrowserAutomationTool(toolCall: ToolCall): Promise<ToolResult> {
+  if (!browserAutomationAvailable) {
+    return {
+      tool_call_id: toolCall.id,
+      name: toolCall.name,
+      result: 'Firefox 暂不支持浏览器自动化',
+      success: false,
+    };
+  }
+
+  if (!browserAutomationSessionId.value || !browserAutomationTurnId.value) {
+    beginBrowserAutomationRun();
+  }
+
+  const context = await resolveSurfaceContext();
+  const baseParams = {
+    ...toolCall.arguments,
+    ...(typeof toolCall.arguments.window_id === 'number' || context.windowId === null ? {} : { window_id: context.windowId }),
+  };
+
+  const sendCommand = async (params: Record<string, any>) => {
+    return await browser.runtime.sendMessage({
+      type: 'BROWSER_AUTOMATION_COMMAND',
+      sessionId: browserAutomationSessionId.value,
+      turnId: browserAutomationTurnId.value,
+      command: toolCall.name,
+      params,
+    });
+  };
+
+  browserAutomationUsed.value = true;
+  let response = await sendCommand(baseParams);
+  if (response?.requiresConfirmation) {
+    const confirmed = await confirmSensitiveBrowserAutomation(response);
+    if (!confirmed) {
+      return {
+        tool_call_id: toolCall.id,
+        name: toolCall.name,
+        result: '用户取消了敏感页面操作',
+        success: false,
+      };
+    }
+    response = await sendCommand({ ...baseParams, confirmed: true });
+  }
+
+  if (response?.meta) {
+    browserAutomationStatus.value = response.meta;
+  }
+  if (toolCall.name === 'browser_finalize_tabs' && response?.success) {
+    browserAutomationFinalized.value = true;
+  }
+
+  return buildBrowserAutomationToolResult(toolCall, response);
 }
 
 // Initialize
@@ -1471,6 +1671,7 @@ const currentThemeIcon = computed(() => {
 onUnmounted(() => {
   chatAbortController.value?.abort();
   chatAbortController.value = null;
+  void endBrowserAutomationRun(false);
   unwatchProviders.value?.();
   unwatchActiveProviderId.value?.();
   unwatchLanguage.value?.();
@@ -1634,6 +1835,10 @@ async function extractCleanPageContent(): Promise<string> {
 
 // 工具执行器
 const toolExecutor: ToolExecutor = async (toolCall: ToolCall): Promise<ToolResult> => {
+  if (isBrowserAutomationTool(toolCall.name)) {
+    return await executeBrowserAutomationTool(toolCall);
+  }
+
   switch (toolCall.name) {
     case 'extract_page_content': {
       const content = await extractCleanPageContent();
@@ -1871,6 +2076,7 @@ async function sendMessage() {
     currentSession.value = await createSession(activeProviderId.value || undefined);
     await loadInitialSessions();
   }
+  beginBrowserAutomationRun();
 
   const messageImages = pendingImages.value.map(image => ({ ...image }));
   const userMessage: ChatMessage = {
@@ -1957,7 +2163,15 @@ async function sendMessage() {
     for await (const event of streamChat(
       provider,
       messages.value.slice(0, -1),
-      { sharePageContent: sharePageContent.value, skills: skillsInfo, mcpTools: mcpTools.value, pageInfo, language: currentLanguage },
+      {
+        sharePageContent: sharePageContent.value,
+        skills: skillsInfo,
+        mcpTools: mcpTools.value,
+        browserAutomationAvailable,
+        browserVisionAvailable: browserAutomationAvailable && activeModelSupportsVision.value,
+        pageInfo,
+        language: currentLanguage,
+      },
       reactConfig,
       undefined, // retryConfig 使用默认值
       hasValidPreviousContext ? previousApiMessages : undefined
@@ -2023,6 +2237,7 @@ async function sendMessage() {
       triggerRef(messages);
     }
   } finally {
+    await endBrowserAutomationRun(!browserAutomationWasStopped.value);
     chatAbortController.value = null;
     isLoading.value = false;
     releaseLockedTab();
@@ -2621,6 +2836,7 @@ function rejectScript() {
             <span class="tab-title">{{ activeTabInfo?.title || i18n('currentTab') }}</span>
           </button>
         </div>
+
       </div>
 
       <div v-if="pendingQuote" class="pending-quote">
@@ -2707,8 +2923,17 @@ function rejectScript() {
             <!-- Backdrop -->
             <div v-if="showModelSelector" class="model-backdrop" @click="showModelSelector = false"></div>
           </div>
-          <button v-if="isLoading" class="stop-btn" @click="terminateCurrentGeneration">
-            {{ i18n('stop') }}
+          <button
+            v-if="isLoading"
+            class="stop-btn"
+            type="button"
+            :title="i18n('stop')"
+            :aria-label="i18n('stop')"
+            @click="terminateCurrentGeneration"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="2" />
+            </svg>
           </button>
           <!-- Send button -->
           <button class="send-btn" @click="sendMessage" :disabled="!canSendMessage">
@@ -2843,6 +3068,42 @@ function rejectScript() {
                 {{ currentLanguage === 'zh-CN' ? '(空)' : '(empty)' }}
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Browser Automation Confirm Modal -->
+    <div v-if="showBrowserAutomationConfirmModal && pendingBrowserAutomationConfirm" class="modal-overlay">
+      <div class="modal browser-automation-confirm-modal">
+        <div class="modal-header">
+          <h2>{{ pendingBrowserAutomationConfirm.title }}</h2>
+        </div>
+        <div class="modal-body">
+          <div class="browser-automation-confirm-copy">
+            <p>{{ pendingBrowserAutomationConfirm.message }}</p>
+          </div>
+          <div v-if="pendingBrowserAutomationConfirm.risk" class="browser-automation-risk">
+            <div class="browser-automation-risk-label">
+              {{ pendingBrowserAutomationConfirm.risk.level === 'destructive'
+                ? (currentLanguage === 'zh-CN' ? '高风险操作' : 'High-risk action')
+                : (currentLanguage === 'zh-CN' ? '敏感操作' : 'Sensitive action') }}
+            </div>
+            <div v-if="pendingBrowserAutomationConfirm.risk.preview" class="browser-automation-risk-preview">
+              {{ pendingBrowserAutomationConfirm.risk.preview }}
+            </div>
+            <div v-if="pendingBrowserAutomationConfirm.risk.reasons.length" class="browser-automation-risk-reasons">
+              {{ pendingBrowserAutomationConfirm.risk.reasons.join(' · ') }}
+            </div>
+          </div>
+          <div class="browser-automation-confirm-note">
+            {{ currentLanguage === 'zh-CN'
+              ? '你可以随时点击停止；Tactus 会停止页面操作，并保留已打开的结果页。'
+              : 'You can stop at any time. Tactus will stop page actions and keep opened result tabs.' }}
+          </div>
+          <div class="script-confirm-actions">
+            <button class="btn btn-outline" @click="resolveBrowserAutomationConfirmation(false)">{{ i18n('cancel') }}</button>
+            <button class="btn btn-primary" @click="resolveBrowserAutomationConfirmation(true)">{{ browserAutomationConfirmPrimaryLabel }}</button>
           </div>
         </div>
       </div>

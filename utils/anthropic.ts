@@ -154,7 +154,12 @@ function convertToAnthropicMessages(
     if (msg.role === 'user') {
       const content = convertUserContent(msg.content);
       if (content) {
-        anthropicMessages.push({ role: 'user', content });
+        const lastMsg = anthropicMessages[anthropicMessages.length - 1];
+        if (lastMsg?.role === 'user' && Array.isArray(lastMsg.content) && Array.isArray(content)) {
+          (lastMsg.content as AnthropicContentBlock[]).push(...content);
+        } else {
+          anthropicMessages.push({ role: 'user', content });
+        }
       }
       continue;
     }
@@ -405,7 +410,7 @@ export async function fetchAnthropicModels(baseUrl: string, apiKey: string): Pro
 
 // ============ Main Streaming Function ============
 
-import { setLastApiMessages, type FunctionCallingConfig, type ToolExecutor } from './api';
+import { appendToolResultMessages, setLastApiMessages, type ChatContextConfig, type FunctionCallingConfig, type ToolExecutor } from './api';
 
 const DEFAULT_RETRY_CONFIG: RetryConfig = {
   maxRetries: 3,
@@ -417,13 +422,7 @@ const DEFAULT_RETRY_CONFIG: RetryConfig = {
 export async function* streamChatAnthropic(
   provider: AIProvider,
   messages: ChatMessage[],
-  context?: {
-    sharePageContent?: boolean;
-    skills?: SkillInfo[];
-    mcpTools?: McpTool[];
-    pageInfo?: { domain: string; title: string; url?: string };
-    language?: Language;
-  },
+  context?: ChatContextConfig,
   config?: FunctionCallingConfig,
   retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG,
   previousApiMessages?: ApiMessage[],
@@ -734,6 +733,7 @@ export async function* streamChatAnthropic(
         },
       }));
 
+      const assistantMessageIndex = currentMessages.length;
       currentMessages.push({
         role: 'assistant',
         content: fullContent || null,
@@ -744,6 +744,7 @@ export async function* streamChatAnthropic(
 
       // Execute each tool call
       let hasExecutionError = false;
+      const deferredImageMessages: ApiMessage[] = [];
       for (const tc of toolCalls) {
         ensureNotAborted();
         if (executedToolCallCount >= maxToolCalls) {
@@ -791,19 +792,19 @@ export async function* streamChatAnthropic(
           break;
         }
 
-        currentMessages.push({
-          role: 'tool',
-          content: result.result,
-          tool_call_id: tc.id,
-          name: tc.name,
-        });
+        appendToolResultMessages(currentMessages, { id: tc.id, name: tc.name }, result, deferredImageMessages);
 
         setLastApiMessages([...currentMessages]);
       }
 
       if (hasExecutionError) {
-        currentMessages.pop();
+        currentMessages.splice(assistantMessageIndex);
         continue;
+      }
+
+      if (deferredImageMessages.length > 0) {
+        currentMessages.push(...deferredImageMessages);
+        setLastApiMessages([...currentMessages]);
       }
 
       continue;

@@ -29,7 +29,7 @@ export default defineConfig({
         'activeTab',
         'scripting',
         'identity',
-        ...(isFirefox ? [] : ['sidePanel']),
+        ...(isFirefox ? [] : ['sidePanel', 'debugger', 'tabs', 'tabGroups']),
       ],
       host_permissions: ['<all_urls>'],
       action: {
